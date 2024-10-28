@@ -22,6 +22,7 @@ android = { level = "full", notes = "" }
 ios = { level = "none", notes = "" }
 
 [build-dependencies]
+sqlx = { version = "0.8", features = ["json", "time"] }
 tauri-plugin = { workspace = true, features = ["build"] }
 
 [dependencies]
