@@ -38,7 +38,7 @@ fn main() {
 
     let migrations_dir = var("MIGRATIONS_DIR").unwrap_or_default();
     let project_dir = var("PROJECT_DIR").unwrap_or_default();
-
+    println!("{}",migrations_dir);
     if migrations_dir.is_empty() || project_dir.is_empty() {
         eprintln!("MIGRATIONS_DIR and PROJECT_DIR must be set.");
         return;
@@ -65,6 +65,7 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", migrations_dir);
+    println!("the file is in:{}",migrations_rs_path.to_string_lossy());
 }
 
 fn needs_generation(migrations_dir: &Path, migrations_rs_path: &Path) -> bool {
@@ -120,24 +121,35 @@ fn generate_migrations_from_directory(directory: &str) -> Result<Vec<Migration>,
             let path = entry.path();
             let filename = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid filename"))?;
             let filename = filename.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid filename string"))?;
-            let parts: Vec<&str> = filename.splitn(2, '-').collect();
+            let parts: Vec<&str> = filename.splitn(3, '-').collect();
 
             if parts.len() != 2 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid filename format"));
             }
-
+            let mut  kind_str = parts[1];
+            if kind_str.is_empty(){
+                kind_str = "up";
+            }
             let version_str = parts[0];
             let description = parts[1].trim_end_matches(".sql").to_string();
             let sql = fs::read_to_string(&path).or_else(|_| Err(io::Error::new(io::ErrorKind::NotFound, "SQL file not found")))?;
             let version: i64 = version_str.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid version format"))?;
 
+            let kind = match kind_str {
+                "up" => MigrationKind::Up,
+                "down" => MigrationKind::Down,
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown migration kind")),
+            };
+
             Ok(Migration {
                 version,
                 description: Cow::Owned(description),
                 sql: Cow::Owned(sql),
-                kind: MigrationKind::Up,
+                kind,
             })
+
         })
+
         .collect::<Result<Vec<Migration>, io::Error>>()?;
     Ok(migrations)
 }
@@ -174,11 +186,11 @@ pub fn migrations() -> Vec<Migration> {{
             version: {},
             description: "{}",
             sql: "{}",
-            kind: MigrationKind::Up,
-        }},
-"#,
-            migration.version, migration.description, sql_escaped
+            kind: MigrationKind::{:?},
+        }},"#,
+            migration.version, migration.description, sql_escaped, migration.kind
         ));
+
     }
 
     content.push_str("    ]\n}\n");
