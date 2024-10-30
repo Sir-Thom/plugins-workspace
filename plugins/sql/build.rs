@@ -5,9 +5,8 @@
 const COMMANDS: &[&str] = &["load", "execute", "select", "close"];
 
 use std::{borrow::Cow, env, fs, io::{self}, path::{Path, PathBuf}, time::SystemTime};
-use std::collections::HashMap;
 use sqlx::migrate::MigrationType;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MigrationKind {
     Up,
     Down,
@@ -22,12 +21,65 @@ impl From<MigrationKind> for MigrationType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Migration {
     pub version: i64,
     pub description: Cow<'static, str>,
     pub sql: Cow<'static, str>,
     pub kind: MigrationKind,
+}
+
+impl Ord for Migration {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.version.cmp(&other.version)
+    }
+}
+
+impl PartialOrd for Migration {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_migration_line(line: &str) -> io::Result<Option<Migration>> {
+    if !line.contains("Migration {") {
+        return Ok(None);
+    }
+
+    let version = line.split("version:")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid version"))?;
+
+    let description = extract_field(line, "description:")
+        .unwrap_or_default()
+        .to_string();
+
+    let sql = extract_field(line, "sql:")
+        .unwrap_or_default()
+        .to_string();
+
+    let kind = match extract_field(line, "kind:").unwrap_or("") {
+        "Up" => MigrationKind::Up,
+        "Down" => MigrationKind::Down,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown migration kind")),
+    };
+
+    Ok(Some(Migration {
+        version,
+        description: Cow::Owned(description),
+        sql: Cow::Owned(sql),
+        kind,
+    }))
+}
+
+fn extract_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    line.split(field)
+        .nth(1)?
+        .split(',')
+        .next()
+        .map(|s| s.trim().trim_matches('"'))
 }
 
 
@@ -47,7 +99,6 @@ fn main() {
     let migrations_rs_path = Path::new(&project_dir).join("src-tauri/src/migrations.rs");
     println!("migrations.rs path: {:?}", migrations_rs_path);
 
-    // Check if generation is needed
     if needs_generation(Path::new(&migrations_dir), &migrations_rs_path) {
         println!("Generation of migrations.rs is needed.");
 
@@ -152,41 +203,16 @@ fn generate_migrations_from_directory(directory: &str) -> Result<Vec<Migration>,
     Ok(migrations)
 }
 
-fn read_existing_migrations(path: &Path) -> Result<HashMap<i64, Migration>, io::Error> {
-    let mut migrations = HashMap::new();
+fn read_existing_migrations(path: &Path) -> io::Result<Vec<Migration>> {
+    let mut migrations = Vec::new();
 
     if let Ok(content) = fs::read_to_string(path) {
         for line in content.lines() {
-            if line.contains("Migration {") {
-                let version_str = line.split_whitespace().find(|s| s.starts_with("version:"))
-                    .and_then(|s| s.split(':').nth(1))
-                    .map(|s| s.trim().parse::<i64>());
-
-                if let Some(Ok(version_num)) = version_str {
-                    let description = line.split_whitespace().find(|s| s.starts_with("description:"))
-                        .and_then(|s| s.split(':').nth(1))
-                        .unwrap_or("").trim().to_string();
-
-                    let sql = line.split_whitespace().find(|s| s.starts_with("sql:"))
-                        .and_then(|s| s.split(':').nth(1))
-                        .unwrap_or("").trim().to_string();
-
-                    let kind_str = line.split_whitespace().find(|s| s.starts_with("kind:"))
-                        .and_then(|s| s.split(':').nth(1))
-                        .unwrap_or("").trim();
-
-                    let kind = match kind_str {
-                        "Up" => MigrationKind::Up,
-                        "Down" => MigrationKind::Down,
-                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown migration kind")),
-                    };
-
-                    migrations.insert(version_num, Migration {
-                        version: version_num,
-                        description: Cow::Owned(description),
-                        sql: Cow::Owned(sql),
-                        kind,
-                    });
+            if let Ok(Some(migration)) = parse_migration_line(line) {
+                // Binary search for insertion position
+                match migrations.binary_search(&migration) {
+                    Ok(pos) => migrations[pos] = migration,
+                    Err(pos) => migrations.insert(pos, migration),
                 }
             }
         }
@@ -196,38 +222,34 @@ fn read_existing_migrations(path: &Path) -> Result<HashMap<i64, Migration>, io::
 }
 
 
-fn write_migrations(migrations_rs_path: &PathBuf, new_migrations: Box<[Migration]>) -> std::io::Result<()> {
+pub fn write_migrations(migrations_rs_path: &PathBuf, new_migrations: Box<[Migration]>) -> io::Result<()> {
     if let Some(parent_dir) = migrations_rs_path.parent() {
         fs::create_dir_all(parent_dir)?;
     }
 
-    let existing_versions = read_existing_migrations(migrations_rs_path)?;
-    let existing_migrations = read_existing_migrations(migrations_rs_path)?;
-    // Debug: Log migration counts
-    println!("Existing migrations count: {}", existing_versions.len());
-    println!("New migrations count: {}", new_migrations.len());
+    let mut migrations = read_existing_migrations(migrations_rs_path)?;
 
-    let mut all_migrations = Vec::new();
-
-    for existing_migration in existing_migrations.values() {
-        all_migrations.push(existing_migration.clone());
-    }
-
-    for migration in &new_migrations {
-        if !existing_migrations.contains_key(&migration.version) {
-            all_migrations.push(migration.clone());
+    // Insert new migrations using binary search
+    for migration in new_migrations.iter() {
+        match migrations.binary_search(migration) {
+            Ok(pos) => migrations[pos] = migration.clone(),
+            Err(pos) => migrations.insert(pos, migration.clone()),
         }
     }
 
-    all_migrations.sort_by_key(|m| m.version);
+    let content = generate_migrations_file_content(&migrations)?;
+    fs::write(migrations_rs_path, content)?;
 
-    println!("Total migrations to write: {}", all_migrations.len());
+    println!("Successfully wrote {} migrations", migrations.len());
+    Ok(())
+}
 
-
+fn generate_migrations_file_content(migrations: &[Migration]) -> io::Result<String> {
     let current_time = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs();
+
     let formatted_date = format!("{:?}", current_time);
     let mut content = format!(r#"/*
  * ===========================================================
@@ -246,7 +268,7 @@ use tauri_plugin_sql::{{Migration, MigrationKind}};
 pub fn migrations() -> Vec<Migration> {{
     vec!["#, formatted_date);
 
-    for migration in &all_migrations {
+    for migration in migrations {
         let sql_escaped = migration.sql.replace('"', r#"\""#);
         content.push_str(&format!(
             r#"
@@ -259,9 +281,7 @@ pub fn migrations() -> Vec<Migration> {{
             migration.version, migration.description, sql_escaped, migration.kind
         ));
     }
-    content.push_str("\n    ]\n}\n");
-    fs::write(migrations_rs_path, content)?;
-    println!("Successfully wrote {} migrations to migrations.rs", all_migrations.len());
 
-    Ok(())
+    content.push_str("\n    ]\n}\n");
+    Ok(content)
 }
